@@ -220,6 +220,7 @@ func NewEngine(deps *Dependencies) *gin.Engine {
 		adminGroup.POST("/providers/nvidia", credHandler.RegisterNvidiaProvider)
 		adminGroup.POST("/providers/ollama", credHandler.RegisterOllamaProvider)
 		adminGroup.POST("/providers/custom", credHandler.RegisterCustomProvider)
+		adminGroup.POST("/providers/custom/batch", credHandler.RegisterCustomProvider)
 		adminGroup.POST("/providers/openrouter", credHandler.RegisterOpenRouterProvider)
 		adminGroup.POST("/providers/1minai", credHandler.RegisterOneMinAIProvider)
 		adminGroup.POST("/providers/cloudflare", credHandler.RegisterCloudflareProvider)

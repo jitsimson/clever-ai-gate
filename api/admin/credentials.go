@@ -501,8 +501,28 @@ func (h *CredentialHandler) RegisterCustomProvider(c *gin.Context) {
 		return
 	}
 
-	if req.APIKey == "" {
-		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "api_key is required for OpenAI-compatible provider discovery"})
+	var keys []string
+	for _, k := range req.APIKeys {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+
+	if len(keys) == 0 && req.APIKey != "" {
+		rawKeys := strings.FieldsFunc(req.APIKey, func(r rune) bool {
+			return r == '\n' || r == '\r' || r == ','
+		})
+		for _, rk := range rawKeys {
+			rk = strings.TrimSpace(rk)
+			if rk != "" {
+				keys = append(keys, rk)
+			}
+		}
+	}
+
+	if len(keys) == 0 {
+		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "api_key or api_keys is required for OpenAI-compatible provider discovery"})
 		return
 	}
 
@@ -516,40 +536,85 @@ func (h *CredentialHandler) RegisterCustomProvider(c *gin.Context) {
 		providerLabel = "custom"
 	}
 
-	// When a label is supplied but no explicit prefix, use the label as the
-	// model prefix automatically. This namespaces discovered models under
-	// "<label>/<model>" (e.g. "huggingface/meta-llama/Llama-3") so that models
-	// from different OpenAI-compatible providers don't silently collide in the
-	// same pool. The clean alias (without prefix) is still registered too, and
-	// the routing layer strips the prefix before forwarding upstream.
 	prefix := req.Prefix
 	if prefix == "" && req.Label != "" {
 		prefix = providerLabel
 	}
 
-	count, models, err := credentials.DiscoverAndRegisterCustomModels(
+	// Single key workflow
+	if len(keys) == 1 && len(req.APIKeys) == 0 {
+		count, models, err := credentials.DiscoverAndRegisterCustomModels(
+			c.Request.Context(),
+			h.db,
+			h.vault,
+			keys[0],
+			req.BaseURL,
+			providerLabel,
+			req.Weight,
+			prefix,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "OpenAI-compatible provider discovery failed", Details: err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, dto.DiscoverProviderResponse{
+			Message:       fmt.Sprintf("Successfully synchronized %d models from %s", count, providerLabel),
+			ModelsCount:   count,
+			DiscoveredIDs: models,
+		})
+
+		// Invalidate Redis cache so all cluster nodes instantly see new custom provider models.
+		h.redisCacheMgr.InvalidateAndPublish(c.Request.Context())
+		return
+	}
+
+	// Batch keys workflow
+	totalKeys, successCount, failedCount, totalModels, results, allDiscovered, err := credentials.DiscoverAndRegisterCustomModelsBatch(
 		c.Request.Context(),
 		h.db,
 		h.vault,
-		req.APIKey,
+		keys,
 		req.BaseURL,
 		providerLabel,
 		req.Weight,
 		prefix,
 	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "OpenAI-compatible provider discovery failed", Details: err.Error()})
+	if err != nil && successCount == 0 {
+		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "OpenAI-compatible batch provider discovery failed", Details: err.Error()})
 		return
 	}
 
+	batchResults := make([]dto.BatchKeyResult, len(results))
+	for i, r := range results {
+		batchResults[i] = dto.BatchKeyResult{
+			Index:         r.Index,
+			KeyMasked:     r.KeyMasked,
+			Success:       r.Success,
+			ModelsCount:   r.ModelsCount,
+			DiscoveredIDs: r.DiscoveredIDs,
+			Error:         r.Error,
+		}
+	}
+
+	msg := fmt.Sprintf("Successfully synchronized %d unique models across %d of %d keys from %s", totalModels, successCount, totalKeys, providerLabel)
+	if failedCount > 0 {
+		msg = fmt.Sprintf("Batch discovery completed: %d of %d keys succeeded, %d failed (%d unique models synchronized)", successCount, totalKeys, failedCount, totalModels)
+	}
+
 	c.JSON(http.StatusOK, dto.DiscoverProviderResponse{
-		Message:       fmt.Sprintf("Successfully synchronized %d models from %s", count, providerLabel),
-		ModelsCount:   count,
-		DiscoveredIDs: models,
+		Message:       msg,
+		ModelsCount:   totalModels,
+		DiscoveredIDs: allDiscovered,
+		TotalKeys:     totalKeys,
+		SuccessCount:  successCount,
+		FailedCount:   failedCount,
+		Results:       batchResults,
 	})
 
-	// Invalidate Redis cache so all cluster nodes instantly see new custom provider models.
-	h.redisCacheMgr.InvalidateAndPublish(c.Request.Context())
+	if successCount > 0 {
+		h.redisCacheMgr.InvalidateAndPublish(c.Request.Context())
+	}
 }
 
 // RegisterOneMinAIProvider auto-discovers all models available on 1min.ai

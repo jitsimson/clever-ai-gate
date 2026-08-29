@@ -52,18 +52,32 @@ type UpdateCredentialRequest struct {
 }
 
 type DiscoverProviderRequest struct {
-	Provider string `json:"provider" binding:"required" example:"nvidia"`
-	APIKey   string `json:"api_key,omitempty" example:"nvapi-..."`
-	BaseURL  string `json:"base_url" binding:"required" example:"https://integrate.api.nvidia.com/v1"`
-	Weight   int    `json:"weight" example:"1"`
-	Label    string `json:"label,omitempty" example:"together-ai"`
-	Prefix   string `json:"prefix,omitempty" example:"exampleprefix"`
+	Provider string   `json:"provider" binding:"required" example:"nvidia"`
+	APIKey   string   `json:"api_key,omitempty" example:"nvapi-..."`
+	APIKeys  []string `json:"api_keys,omitempty"`
+	BaseURL  string   `json:"base_url" binding:"required" example:"https://integrate.api.nvidia.com/v1"`
+	Weight   int      `json:"weight" example:"1"`
+	Label    string   `json:"label,omitempty" example:"together-ai"`
+	Prefix   string   `json:"prefix,omitempty" example:"exampleprefix"`
+}
+
+type BatchKeyResult struct {
+	Index         int      `json:"index"`
+	KeyMasked     string   `json:"key_masked"`
+	Success       bool     `json:"success"`
+	ModelsCount   int      `json:"models_count,omitempty"`
+	DiscoveredIDs []string `json:"discovered_models,omitempty"`
+	Error         string   `json:"error,omitempty"`
 }
 
 type DiscoverProviderResponse struct {
-	Message       string   `json:"message" example:"Successfully synchronized provider models"`
-	ModelsCount   int      `json:"models_count" example:"45"`
-	DiscoveredIDs []string `json:"discovered_models"`
+	Message       string           `json:"message" example:"Successfully synchronized provider models"`
+	ModelsCount   int              `json:"models_count" example:"45"`
+	DiscoveredIDs []string         `json:"discovered_models"`
+	TotalKeys     int              `json:"total_keys,omitempty"`
+	SuccessCount  int              `json:"success_count,omitempty"`
+	FailedCount   int              `json:"failed_count,omitempty"`
+	Results       []BatchKeyResult `json:"results,omitempty"`
 }
 
 // DiscoverCloudflareRequest is the request body for POST /api/v1/admin/providers/cloudflare.

@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { KeyRound, RefreshCw, Plus, Shield, AlertTriangle, Server, Pencil, Trash2, X, Search, Radar, ChevronDown, ChevronUp, CheckCircle, XCircle, Clock } from '@lucide/svelte';
+  import { KeyRound, Layers, RefreshCw, Plus, Shield, AlertTriangle, Server, Pencil, Trash2, X, Search, Radar, ChevronDown, ChevronUp, CheckCircle, XCircle, Clock } from '@lucide/svelte';
   import { appState } from '$lib/state.svelte.js';
   import Button from '$lib/components/Button.svelte';
   import Input from '$lib/components/Input.svelte';
@@ -52,13 +52,33 @@
 
   // Add/Edit modals
   let showAddProviderModal = $state(false);
-  let addProviderTab = $state('standard'); // 'standard' | 'autodiscovery'
+  let addProviderTab = $state('autodiscovery'); // 'standard' | 'autodiscovery'
   let addProviderForm = $state({ pool_id: '', provider: 'openai', api_key: '', base_url: 'https://api.openai.com', weight: 1 });
   let addProviderLoading = $state(false);
 
   // Auto-discovery form
-  let autoDiscoverForm = $state({ provider: 'openrouter', api_key: '', base_url: 'https://openrouter.ai/api/v1', weight: 1, label: '', account_id: '', api_token: '' });
+  let autoDiscoverForm = $state({ provider: 'custom', api_key: '', base_url: '', weight: 1, label: '', account_id: '', api_token: '' });
+  let customKeyMode = $state('single'); // 'single' | 'batch'
+  let batchKeysText = $state('');
+  let batchReport = $state(null);
   let autoDiscoverLoading = $state(false);
+
+  let parsedBatchKeys = $derived.by(() => {
+    if (!batchKeysText.trim()) return [];
+    const lines = batchKeysText.split(/[\r\n,]+/);
+    const seen = new Set();
+    const result = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed && !seen.has(trimmed)) {
+        seen.add(trimmed);
+        result.push(trimmed);
+      }
+    }
+    return result;
+  });
+
+  let parsedBatchKeysCount = $derived(parsedBatchKeys.length);
 
   // Edit modal
   let showEditModal = $state(false);
@@ -195,8 +215,11 @@
 
   function openAddProviderModal() {
     addProviderForm = { pool_id: '', provider: 'openai', api_key: '', base_url: 'https://api.openai.com', weight: 1 };
-    autoDiscoverForm = { provider: 'nvidia', api_key: '', base_url: 'https://integrate.api.nvidia.com/v1', weight: 1, label: '', account_id: '', api_token: '' };
-    addProviderTab = 'standard';
+    autoDiscoverForm = { provider: 'custom', api_key: '', base_url: '', weight: 1, label: '', account_id: '', api_token: '' };
+    customKeyMode = 'single';
+    batchKeysText = '';
+    batchReport = null;
+    addProviderTab = 'autodiscovery';
     showAddProviderModal = true;
     loadPools();
   }
@@ -233,8 +256,16 @@
   }
 
   async function autoDiscoverProvider() {
+    if (autoDiscoverForm.provider === 'custom' && customKeyMode === 'batch') {
+      if (parsedBatchKeys.length === 0) {
+        appState.addToast('error', 'Please enter at least one API key in the batch input box');
+        return;
+      }
+    }
+
     autoDiscoverLoading = true;
     appState.apiLoading = true;
+    batchReport = null;
     let endpoint;
     if (autoDiscoverForm.provider === 'nvidia') {
       endpoint = '/api/v1/admin/providers/nvidia';
@@ -268,6 +299,16 @@
           api_token: autoDiscoverForm.api_token,
           weight: autoDiscoverForm.weight || 1
         };
+      } else if (autoDiscoverForm.provider === 'custom' && customKeyMode === 'batch') {
+        payload = {
+          provider: 'custom',
+          api_keys: parsedBatchKeys,
+          base_url: autoDiscoverForm.base_url,
+          weight: autoDiscoverForm.weight || 1
+        };
+        if (autoDiscoverForm.label) {
+          payload.label = autoDiscoverForm.label;
+        }
       } else {
         payload = {
           provider: autoDiscoverForm.provider,
@@ -296,7 +337,18 @@
           : autoDiscoverForm.provider === 'zenmux' ? 'ZenMux'
           : autoDiscoverForm.provider === 'gemini' ? 'Google AI Studio (Gemini)'
           : autoDiscoverForm.provider.toUpperCase();
-        appState.addToast('success', `Successfully synchronized ${data.models_count || 0} ${displayName} models`);
+
+        if (data.results && data.results.length > 0) {
+          if (data.failed_count > 0) {
+            batchReport = data;
+            appState.addToast(data.success_count > 0 ? 'warning' : 'error', data.message || `Batch finished: ${data.success_count} succeeded, ${data.failed_count} failed`);
+            reloadCredentials();
+            if (appState.apiKey) appState.loadModels();
+            return;
+          }
+        }
+
+        appState.addToast('success', data.message || `Successfully synchronized ${data.models_count || 0} ${displayName} models`);
         showAddProviderModal = false;
         reloadCredentials();
         if (appState.apiKey) appState.loadModels();
@@ -1081,9 +1133,63 @@
 
       {#if autoDiscoverForm.provider === 'custom'}
         <Input type="text" label="Label (namespace prefix)" placeholder="e.g. huggingface, together, deepinfra" bind:value={autoDiscoverForm.label} />
-        <div class="rounded-lg border border-[#f97316]/20 bg-[#f97316]/5 px-4 py-3 text-xs text-[#fb923c] leading-relaxed">
-          🏷️ The label namespaces every discovered model as <code>&lt;label&gt;/&lt;model&gt;</code> (e.g. <code>huggingface/meta-llama/Llama-3</code>). This keeps models from different providers in separate pools. The clean name (without the prefix) is also registered so strict clients still work. Requests to <code>&lt;label&gt;/...</code> automatically strip the prefix before hitting the upstream API.
+
+        <!-- Key Mode Toggle (Single vs Batch) -->
+        <div class="flex flex-col gap-1.5">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold uppercase tracking-wider text-secondary">Key Registration Mode</span>
+            <div class="inline-flex rounded-lg bg-[var(--frame-bg)] p-0.5 border border-[var(--border-color)]">
+              <button
+                type="button"
+                class="flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-md transition-all {customKeyMode === 'single' ? 'bg-[#f97316] text-white shadow-sm' : 'text-secondary hover:text-[var(--text-primary)]'}"
+                onclick={() => customKeyMode = 'single'}
+              >
+                <KeyRound size={12} />
+                <span>Single Key</span>
+              </button>
+              <button
+                type="button"
+                class="flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-md transition-all {customKeyMode === 'batch' ? 'bg-[#f97316] text-white shadow-sm' : 'text-secondary hover:text-[var(--text-primary)]'}"
+                onclick={() => customKeyMode = 'batch'}
+              >
+                <Layers size={12} />
+                <span>Bulk / Batch Keys</span>
+                {#if parsedBatchKeysCount > 0}
+                  <span class="ml-0.5 px-1.5 py-0.2 text-[10px] font-bold rounded-full {customKeyMode === 'batch' ? 'bg-white/20 text-white' : 'bg-orange-500/20 text-orange-400'}">
+                    {parsedBatchKeysCount}
+                  </span>
+                {/if}
+              </button>
+            </div>
+          </div>
         </div>
+
+        {#if customKeyMode === 'batch'}
+          <div class="flex flex-col gap-1.5">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-bold uppercase tracking-wider text-secondary">API Keys (Bulk)</span>
+              {#if parsedBatchKeysCount > 0}
+                <span class="text-xs font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full flex items-center gap-1">
+                  <CheckCircle size={11} /> {parsedBatchKeysCount} {parsedBatchKeysCount === 1 ? 'key' : 'keys'} detected
+                </span>
+              {/if}
+            </div>
+            <Input
+              type="textarea"
+              rows={5}
+              placeholder="Paste multiple API keys here (one key per line, or comma-separated)...&#10;sk-key-1...&#10;sk-key-2...&#10;sk-key-3..."
+              bind:value={batchKeysText}
+            />
+            <p class="text-[11px] text-secondary/70">Each key will be auto-discovered. Successful keys will bind to the model pools for round-robin load balancing.</p>
+          </div>
+        {:else}
+          <Input 
+            type="password" 
+            label="API Key" 
+            placeholder="Bearer API key..." 
+            bind:value={autoDiscoverForm.api_key} 
+          />
+        {/if}
       {/if}
 
       {#if autoDiscoverForm.provider === 'cloudflare'}
@@ -1100,7 +1206,7 @@
           placeholder="Workers AI API Token..."
           bind:value={autoDiscoverForm.api_token}
         />
-      {:else}
+      {:else if autoDiscoverForm.provider !== 'custom'}
         <Input 
           type="password" 
           label="API Key" 
@@ -1118,13 +1224,78 @@
           } 
           bind:value={autoDiscoverForm.api_key} 
         />
-        
-        {#if autoDiscoverForm.provider !== 'openrouter' && autoDiscoverForm.provider !== '1minai' && autoDiscoverForm.provider !== 'sarvam' && autoDiscoverForm.provider !== 'puter' && autoDiscoverForm.provider !== 'agentrouter' && autoDiscoverForm.provider !== 'zenmux' && autoDiscoverForm.provider !== 'gemini'}
-          <Input type="text" label="Base URL" placeholder={autoDiscoverForm.provider === 'custom' ? 'https://api.together.xyz/v1' : ''} bind:value={autoDiscoverForm.base_url} />
-        {/if}
+      {/if}
+
+      {#if autoDiscoverForm.provider !== 'openrouter' && autoDiscoverForm.provider !== '1minai' && autoDiscoverForm.provider !== 'sarvam' && autoDiscoverForm.provider !== 'puter' && autoDiscoverForm.provider !== 'agentrouter' && autoDiscoverForm.provider !== 'zenmux' && autoDiscoverForm.provider !== 'gemini' && autoDiscoverForm.provider !== 'cloudflare'}
+        <Input type="text" label="Base URL" placeholder={autoDiscoverForm.provider === 'custom' ? 'https://api.together.xyz/v1' : ''} bind:value={autoDiscoverForm.base_url} />
       {/if}
       
       <Input type="number" label="Weight" min="1" bind:value={autoDiscoverForm.weight} />
+
+      {#if autoDiscoverLoading}
+        <div class="rounded-xl border border-orange-500/20 bg-orange-500/5 p-4 flex flex-col gap-2.5">
+          <div class="flex items-center gap-3">
+            <RefreshCw size={16} class="animate-spin text-orange-400 shrink-0" />
+            <div class="flex flex-col">
+              <span class="text-xs font-semibold text-orange-400">
+                {#if autoDiscoverForm.provider === 'custom' && customKeyMode === 'batch' && parsedBatchKeysCount > 0}
+                  Auto-discovering and registering {parsedBatchKeysCount} keys...
+                {:else}
+                  Validating credentials and synchronizing models...
+                {/if}
+              </span>
+              <span class="text-[11px] text-secondary">
+                Querying provider endpoint and binding credentials to model pools
+              </span>
+            </div>
+          </div>
+        </div>
+      {/if}
+
+      {#if batchReport}
+        <div class="rounded-xl border {batchReport.failed_count > 0 ? 'border-amber-500/30 bg-amber-500/5' : 'border-emerald-500/30 bg-emerald-500/5'} p-4 flex flex-col gap-3">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              {#if batchReport.failed_count > 0}
+                <AlertTriangle size={16} class="text-amber-400 shrink-0" />
+                <span class="text-xs font-bold text-amber-400">Batch Processing Summary</span>
+              {:else}
+                <CheckCircle size={16} class="text-emerald-400 shrink-0" />
+                <span class="text-xs font-bold text-emerald-400">Batch Discovery Completed</span>
+              {/if}
+            </div>
+            <span class="text-xs font-medium text-secondary">
+              {batchReport.success_count}/{batchReport.total_keys} Succeeded
+            </span>
+          </div>
+
+          <div class="flex flex-col gap-1.5 max-h-48 overflow-y-auto pr-1">
+            {#each batchReport.results as res}
+              <div class="flex items-center justify-between text-xs px-3 py-2 rounded-lg bg-[var(--frame-bg)] border border-[var(--border-color)]">
+                <div class="flex items-center gap-2 font-mono">
+                  {#if res.success}
+                    <CheckCircle size={13} class="text-emerald-400 shrink-0" />
+                  {:else}
+                    <XCircle size={13} class="text-red-400 shrink-0" />
+                  {/if}
+                  <span class="text-[var(--text-primary)]">Key #{res.index}: {res.key_masked}</span>
+                </div>
+                {#if res.success}
+                  <span class="text-emerald-400 font-semibold">{res.models_count} models</span>
+                {:else}
+                  <span class="text-red-400 truncate max-w-[200px]" title={res.error}>{res.error || 'Failed'}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+
+          {#if batchReport.failed_count > 0}
+            <div class="flex justify-end pt-1">
+              <Button size="sm" variant="outline" onclick={() => { batchReport = null; }}>Dismiss</Button>
+            </div>
+          {/if}
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -1140,13 +1311,19 @@
           {/if}
         </Button>
       {:else}
-        <Button variant="primary" onclick={autoDiscoverProvider} disabled={autoDiscoverLoading}>
-          {#if autoDiscoverLoading}
-            <span class="animate-spin">⟳</span> Discovering...
-          {:else}
-            Discover & Register
-          {/if}
-        </Button>
+        {#if batchReport && batchReport.failed_count > 0}
+          <Button variant="primary" onclick={() => { showAddProviderModal = false; batchReport = null; }}>
+            Done
+          </Button>
+        {:else}
+          <Button variant="primary" onclick={autoDiscoverProvider} disabled={autoDiscoverLoading}>
+            {#if autoDiscoverLoading}
+              <span class="animate-spin">⟳</span> Discovering...
+            {:else}
+              Discover & Register {autoDiscoverForm.provider === 'custom' && customKeyMode === 'batch' && parsedBatchKeysCount > 0 ? `(${parsedBatchKeysCount} Keys)` : ''}
+            {/if}
+          </Button>
+        {/if}
       {/if}
     </div>
   {/snippet}
