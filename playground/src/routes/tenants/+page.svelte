@@ -95,8 +95,8 @@
         headers: adminHeaders(),
         body: JSON.stringify({
           name: addForm.name,
-          token_balance: Number(addForm.token_balance),
-          rate_limit_rpm: Number(addForm.rate_limit_rpm)
+          token_balance: addForm.token_balance,
+          rate_limit_rpm: addForm.rate_limit_rpm
         })
       });
       if (res.status === 201 || res.ok) {
@@ -149,8 +149,8 @@
         headers: adminHeaders(),
         body: JSON.stringify({
           name: editForm.name,
-          token_balance: Number(editForm.token_balance),
-          rate_limit_rpm: Number(editForm.rate_limit_rpm),
+          token_balance: editForm.token_balance,
+          rate_limit_rpm: editForm.rate_limit_rpm,
           is_active: editForm.is_active
         })
       });
@@ -339,16 +339,36 @@
       placeholder="Acme Corp, Mobile Client..." 
       bind:value={addForm.name} 
     />
-    <Input 
-      type="number" 
-      label="Token Balance" 
-      bind:value={addForm.token_balance} 
-    />
-    <Input 
-      type="number" 
-      label="Rate Limit (RPM)" 
-      bind:value={addForm.rate_limit_rpm} 
-    />
+    <div class="flex flex-col gap-1.5">
+      <div class="flex justify-between items-center">
+        <span class="text-xs font-bold uppercase tracking-wider text-secondary">Token Balance</span>
+        <button 
+          type="button" 
+          class="text-xs text-primary hover:underline cursor-pointer"
+          onclick={() => addForm.token_balance = 9000000000000000}>
+          Set Unlimited
+        </button>
+      </div>
+      <Input 
+        type="number" 
+        bind:value={addForm.token_balance} 
+      />
+    </div>
+    <div class="flex flex-col gap-1.5">
+      <div class="flex justify-between items-center">
+        <span class="text-xs font-bold uppercase tracking-wider text-secondary">Rate Limit (RPM)</span>
+        <button 
+          type="button" 
+          class="text-xs text-primary hover:underline cursor-pointer"
+          onclick={() => addForm.rate_limit_rpm = 2000000000}>
+          Set Unlimited
+        </button>
+      </div>
+      <Input 
+        type="number" 
+        bind:value={addForm.rate_limit_rpm} 
+      />
+    </div>
   </div>
 
   {#snippet footer()}
@@ -375,8 +395,8 @@
       Tenant <strong>{createdTenant.name}</strong> was created successfully. Copy their API Key below. You will not be able to see it again.
     </p>
 
-    <div class="flex w-full gap-3 p-4 bg-zinc-900 border border-zinc-800 rounded-xl font-mono text-sm select-text justify-between items-center my-2" style="background-color: #0c0c0f;">
-      <span class="truncate text-green-500 font-bold text-left flex-grow pr-2">{createdTenant.api_key}</span>
+    <div class="flex items-center gap-2 w-full bg-surface-2 p-2.5 rounded-lg border border-border font-mono text-xs text-primary break-all select-all">
+      <span class="flex-grow text-left">{createdTenant.api_key}</span>
       <Button variant="secondary" size="sm" onclick={copyTenantKey} class="shrink-0">
         {#if keyCopied}
           <Check size={16} class="text-green-500" />
@@ -404,17 +424,35 @@
       label="Tenant Name" 
       bind:value={editForm.name} 
     />
-    <Input 
-      type="number" 
-      label="Token Balance" 
-      bind:value={editForm.token_balance} 
-    />
+    <div class="flex flex-col gap-1.5">
+      <div class="flex justify-between items-center">
+        <span class="text-xs font-bold uppercase tracking-wider text-secondary">Token Balance</span>
+        <button 
+          type="button" 
+          class="text-xs text-primary hover:underline cursor-pointer"
+          onclick={() => editForm.token_balance = 9000000000000000}>
+          Set Unlimited
+        </button>
+      </div>
+      <Input 
+        type="number" 
+        bind:value={editForm.token_balance} 
+      />
+    </div>
     
     <div class="flex gap-4 items-end">
-      <div class="flex-grow">
+      <div class="flex-grow flex flex-col gap-1.5">
+        <div class="flex justify-between items-center">
+          <span class="text-xs font-bold uppercase tracking-wider text-secondary">Rate Limit (RPM)</span>
+          <button 
+            type="button" 
+            class="text-xs text-primary hover:underline cursor-pointer"
+            onclick={() => editForm.rate_limit_rpm = 2000000000}>
+            Set Unlimited
+          </button>
+        </div>
         <Input 
           type="number" 
-          label="Rate Limit (RPM)" 
           bind:value={editForm.rate_limit_rpm} 
         />
       </div>

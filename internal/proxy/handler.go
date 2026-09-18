@@ -173,15 +173,42 @@ func (h *Handler) Handle(c *gin.Context) {
 			)
 		}
 
+		// Stage 1: Try fast scan on the leading metadata segment.
 		modelBytes, _, _, err := jsonparser.Get(scanSlice, "model")
-		if err != nil || len(modelBytes) == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "missing or invalid 'model' field"})
-			return
-		}
-		model = string(modelBytes)
 
-		// Step 3: Detect streaming mode (also bounded to metadata segment)
-		isStream, _ = jsonparser.GetBoolean(scanSlice, "stream")
+		// Stage 2: If model was not found in scanSlice (e.g. long chat history where "model" is placed
+		// after "messages" or scanSlice cut across an arbitrary byte boundary), scan the entire body.
+		if (err != nil || len(modelBytes) == 0) && len(body) > len(scanSlice) {
+			modelBytes, _, _, err = jsonparser.Get(body, "model")
+		}
+
+		// Stage 3: Zero-alloc byte-level token fallback if jsonparser encountered syntax issues in message payloads.
+		if err != nil || len(modelBytes) == 0 {
+			if fbModel := extractModelFromJSONBytes(body); fbModel != "" {
+				model = fbModel
+			} else {
+				h.logger.Warn("request rejected: missing or invalid 'model' field",
+					zap.Int("body_bytes", len(body)),
+					zap.String("client_ip", c.ClientIP()),
+					zap.Error(err),
+				)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "missing or invalid 'model' field"})
+				return
+			}
+		} else {
+			model = string(modelBytes)
+		}
+
+		// Step 3: Detect streaming mode
+		// Try scanSlice first, then full body if needed, then fallback byte scan.
+		var streamErr error
+		isStream, streamErr = jsonparser.GetBoolean(scanSlice, "stream")
+		if streamErr != nil && len(body) > len(scanSlice) {
+			isStream, streamErr = jsonparser.GetBoolean(body, "stream")
+		}
+		if streamErr != nil {
+			isStream = detectStreamFromJSONBytes(body)
+		}
 	}
 
 	requestedModel := model
@@ -2436,6 +2463,102 @@ func stripModelPrefixInPlace(body []byte, fullModel, prefixToStrip string) []byt
 	return body[:len(body)-diff]
 }
 
+// extractModelFromJSONBytes is a resilient zero-alloc byte-level scanner for extracting
+// the "model" field from raw JSON bytes if jsonparser fails on large or partially malformed payloads.
+func extractModelFromJSONBytes(body []byte) string {
+	target := []byte(`"model"`)
+	start := 0
+	for {
+		idx := bytes.Index(body[start:], target)
+		if idx == -1 {
+			return ""
+		}
+		actualIdx := start + idx
+		// Check that "model" is not an escaped string inside another string value (e.g. \"model\")
+		if actualIdx > 0 && body[actualIdx-1] == '\\' {
+			start = actualIdx + len(target)
+			continue
+		}
+
+		pos := actualIdx + len(target)
+		// Skip whitespace
+		for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n') {
+			pos++
+		}
+		if pos < len(body) && body[pos] == ':' {
+			pos++
+			// Skip whitespace after colon
+			for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n') {
+				pos++
+			}
+			if pos < len(body) && body[pos] == '"' {
+				pos++
+				valStart := pos
+				escaped := false
+				for pos < len(body) {
+					if escaped {
+						escaped = false
+						pos++
+						continue
+					}
+					if body[pos] == '\\' {
+						escaped = true
+						pos++
+						continue
+					}
+					if body[pos] == '"' {
+						val := string(body[valStart:pos])
+						if strings.Contains(val, `\`) {
+							var unescaped string
+							if json.Unmarshal([]byte(`"`+val+`"`), &unescaped) == nil {
+								return unescaped
+							}
+						}
+						return val
+					}
+					pos++
+				}
+			}
+		}
+		start = actualIdx + len(target)
+	}
+}
+
+// detectStreamFromJSONBytes scans raw JSON bytes for a top-level "stream": true boolean.
+func detectStreamFromJSONBytes(body []byte) bool {
+	target := []byte(`"stream"`)
+	start := 0
+	for {
+		idx := bytes.Index(body[start:], target)
+		if idx == -1 {
+			return false
+		}
+		actualIdx := start + idx
+		if actualIdx > 0 && body[actualIdx-1] == '\\' {
+			start = actualIdx + len(target)
+			continue
+		}
+
+		pos := actualIdx + len(target)
+		for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n') {
+			pos++
+		}
+		if pos < len(body) && body[pos] == ':' {
+			pos++
+			for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n') {
+				pos++
+			}
+			if pos+4 <= len(body) && string(body[pos:pos+4]) == "true" {
+				return true
+			}
+			if pos+5 <= len(body) && string(body[pos:pos+5]) == "false" {
+				return false
+			}
+		}
+		start = actualIdx + len(target)
+	}
+}
+
 // --- NVIDIA Reasoning Parameter Injection ---
 
 // injectNvidiaParams injects NVIDIA-specific reasoning parameters into the request body.
@@ -2451,13 +2574,17 @@ func stripModelPrefixInPlace(body []byte, fullModel, prefixToStrip string) []byt
 // The caller receives a new byte slice — the original body is not modified.
 func injectNvidiaParams(body, scanSlice []byte, logger *zap.Logger) []byte {
 	// Check if reasoning_budget is already present (avoid double injection)
-	if bytes.Contains(scanSlice, []byte(`"reasoning_budget"`)) {
+	if bytes.Contains(scanSlice, []byte(`"reasoning_budget"`)) || (len(body) > len(scanSlice) && bytes.Contains(body, []byte(`"reasoning_budget"`))) {
 		return body
 	}
 
 	// Extract max_tokens for reasoning_budget (default 4096)
 	reasoningBudget := 4096
-	if maxTokens, err := jsonparser.GetInt(scanSlice, "max_tokens"); err == nil && maxTokens > 0 {
+	maxTokens, err := jsonparser.GetInt(scanSlice, "max_tokens")
+	if (err != nil || maxTokens <= 0) && len(body) > len(scanSlice) {
+		maxTokens, err = jsonparser.GetInt(body, "max_tokens")
+	}
+	if err == nil && maxTokens > 0 {
 		reasoningBudget = int(maxTokens)
 	}
 

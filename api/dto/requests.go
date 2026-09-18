@@ -1,5 +1,13 @@
 package dto
 
+import (
+	"encoding/json"
+	"math"
+	"math/big"
+	"strconv"
+	"strings"
+)
+
 // --- Request DTOs ---
 
 // CreateTenantRequest represents the body for creating a tenant.
@@ -9,12 +17,149 @@ type CreateTenantRequest struct {
 	RateLimitRPM int    `json:"rate_limit_rpm,omitempty" example:"60"`
 }
 
+// UnmarshalJSON implements custom JSON unmarshaling to gracefully handle
+// arbitrarily large numbers (e.g. 100000000000000000000, 9999999999999999999),
+// scientific notation, and string numbers, clamping values to math.MaxInt64 and math.MaxInt32.
+func (r *CreateTenantRequest) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name         string          `json:"name"`
+		TokenBalance json.RawMessage `json:"token_balance"`
+		RateLimitRPM json.RawMessage `json:"rate_limit_rpm"`
+	}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	r.Name = raw.Name
+	r.TokenBalance = parseClampedInt64(raw.TokenBalance, 0, math.MaxInt64)
+	r.RateLimitRPM = parseClampedInt(raw.RateLimitRPM, 0, math.MaxInt32)
+	return nil
+}
+
 // UpdateTenantRequest represents the body for updating a tenant.
 type UpdateTenantRequest struct {
 	Name         string `json:"name" binding:"required" example:"Acme Corp Updated"`
 	TokenBalance int64  `json:"token_balance" example:"2000000000"`
 	IsActive     bool   `json:"is_active" example:"true"`
 	RateLimitRPM int    `json:"rate_limit_rpm" example:"120"`
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling for updating a tenant,
+// safely clamping values that exceed int64 or int32 bounds.
+func (r *UpdateTenantRequest) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name         string          `json:"name"`
+		TokenBalance json.RawMessage `json:"token_balance"`
+		IsActive     *bool           `json:"is_active"`
+		RateLimitRPM json.RawMessage `json:"rate_limit_rpm"`
+	}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	r.Name = raw.Name
+	if raw.IsActive != nil {
+		r.IsActive = *raw.IsActive
+	} else {
+		r.IsActive = true
+	}
+	r.TokenBalance = parseClampedInt64(raw.TokenBalance, 0, math.MaxInt64)
+	r.RateLimitRPM = parseClampedInt(raw.RateLimitRPM, 0, math.MaxInt32)
+	return nil
+}
+
+// parseClampedInt64 parses a json.RawMessage (number or string) and clamps it to [0, maxVal].
+func parseClampedInt64(raw json.RawMessage, defaultVal, maxVal int64) int64 {
+	if len(raw) == 0 {
+		return defaultVal
+	}
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return defaultVal
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	if s == "" || s == "null" {
+		return defaultVal
+	}
+	lower := strings.ToLower(s)
+	if lower == "unlimited" || lower == "infinity" || lower == "inf" || lower == "max" {
+		return maxVal
+	}
+
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if v < 0 {
+			return 0
+		}
+		if v > maxVal {
+			return maxVal
+		}
+		return v
+	}
+
+	bf, _, err := new(big.Float).Parse(s, 10)
+	if err == nil {
+		if bf.Sign() <= 0 {
+			return 0
+		}
+		maxBf := new(big.Float).SetInt64(maxVal)
+		if bf.Cmp(maxBf) >= 0 {
+			return maxVal
+		}
+		val, _ := bf.Int64()
+		return val
+	}
+
+	return defaultVal
+}
+
+// parseClampedInt parses a json.RawMessage (number or string) and clamps it to [0, maxVal].
+func parseClampedInt(raw json.RawMessage, defaultVal, maxVal int) int {
+	if len(raw) == 0 {
+		return defaultVal
+	}
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return defaultVal
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	if s == "" || s == "null" {
+		return defaultVal
+	}
+	lower := strings.ToLower(s)
+	if lower == "unlimited" || lower == "infinity" || lower == "inf" || lower == "max" {
+		return maxVal
+	}
+
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if v < 0 {
+			return 0
+		}
+		if v > int64(maxVal) {
+			return maxVal
+		}
+		return int(v)
+	}
+
+	bf, _, err := new(big.Float).Parse(s, 10)
+	if err == nil {
+		if bf.Sign() <= 0 {
+			return 0
+		}
+		maxBf := new(big.Float).SetInt64(int64(maxVal))
+		if bf.Cmp(maxBf) >= 0 {
+			return maxVal
+		}
+		val, _ := bf.Int64()
+		return int(val)
+	}
+
+	return defaultVal
 }
 
 // CreatePoolRequest represents the body for creating a model routing pool.

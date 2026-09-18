@@ -538,3 +538,100 @@ func TestFindPoolByPrefix_GenericSlash(t *testing.T) {
 	}
 }
 
+func TestHandle_LargePayloadTrailingModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		CacheMaxSizeMB:   10,
+		CacheNumCounters: 100,
+	}
+	cacheStore, err := cache.New(cfg, logger)
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+	defer cacheStore.Close()
+
+	cred := &credentials.RuntimeCredential{
+		ID:       1,
+		Provider: "openai",
+		APIKey:   "sk-test-key",
+		BaseURL:  "https://api.openai.com",
+		Weight:   1,
+	}
+	targetModel := "test-large-chat-model"
+	pool := credentials.NewBalancedPool(targetModel, "round-robin", []*credentials.RuntimeCredential{cred}, nil)
+	cacheStore.Set(cache.PoolKey(targetModel), pool, 100)
+	cacheStore.Wait()
+
+	var capturedUpstreamModel string
+	var capturedStream bool
+	mockClient := &http.Client{
+		Transport: &mockRoundTripper{
+			roundTripFunc: func(req *http.Request) (*http.Response, error) {
+				bodyBytes, _ := io.ReadAll(req.Body)
+				mBytes, _, _, _ := jsonparser.Get(bodyBytes, "model")
+				capturedUpstreamModel = string(mBytes)
+				capturedStream, _ = jsonparser.GetBoolean(bodyBytes, "stream")
+
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n`)),
+				}
+				resp.Header.Set("Content-Type", "text/event-stream")
+				return resp, nil
+			},
+		},
+	}
+
+	h := NewHandler(mockClient, cacheStore, nil, logger, nil, nil, nil)
+
+	// Create a payload larger than 256KB (e.g. 350KB) where "messages" is at the start
+	// and "model" and "stream" are placed at the very end of the JSON object.
+	largeContent := strings.Repeat("a long chat message history with source code and context. ", 6000) // ~350KB
+	requestJSON := `{"messages":[{"role":"user","content":"` + largeContent + `"}],"model":"` + targetModel + `","stream":true}`
+
+	if len(requestJSON) < 300*1024 {
+		t.Fatalf("test payload size should be > 300KB, got %d", len(requestJSON))
+	}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(requestJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	h.Handle(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d with body: %s", w.Code, w.Body.String())
+	}
+	if capturedUpstreamModel != targetModel {
+		t.Errorf("expected model %q forwarded upstream, got %q", targetModel, capturedUpstreamModel)
+	}
+	if !capturedStream {
+		t.Errorf("expected stream=true, got false")
+	}
+}
+
+func TestExtractModelAndStreamFallback(t *testing.T) {
+	// 1. Model and stream at the end
+	payload1 := []byte(`{"messages":[],"model":"custom-agent/v1","stream":true}`)
+	if m := extractModelFromJSONBytes(payload1); m != "custom-agent/v1" {
+		t.Errorf("expected 'custom-agent/v1', got %q", m)
+	}
+	if !detectStreamFromJSONBytes(payload1) {
+		t.Errorf("expected stream=true")
+	}
+
+	// 2. Escaped "model" inside message content should be ignored
+	payload2 := []byte(`{"messages":[{"role":"user","content":"what is \"model\":\"fake\"?"}],"model":"real-model","stream":false}`)
+	if m := extractModelFromJSONBytes(payload2); m != "real-model" {
+		t.Errorf("expected 'real-model', got %q", m)
+	}
+	if detectStreamFromJSONBytes(payload2) {
+		t.Errorf("expected stream=false")
+	}
+}
+
+
