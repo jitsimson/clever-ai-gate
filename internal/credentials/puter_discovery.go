@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -164,4 +165,67 @@ func fetchPuterModels(ctx context.Context, apiKey string) ([]puterModelDetail, e
 	}
 
 	return directList, nil
+}
+
+// DiscoverAndRegisterPuterModelsBatch processes multiple Puter.com auth tokens one
+// by one: each token is validated against the Puter models endpoint, and every token
+// that passes discovery is bound to all puter/* model pools — mirroring the
+// custom-provider batch workflow so admins can register a stack of free Puter
+// accounts for round-robin load balancing in a single request.
+//
+// A per-token report (masked key, success flag, model count, error) is collected so
+// the admin UI can display exactly which tokens were imported and which failed.
+func DiscoverAndRegisterPuterModelsBatch(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	vault *Vault,
+	apiKeys []string,
+	weight int,
+) (totalKeys, successCount, failedCount, totalModels int, results []BatchKeyDiscoveryResult, allDiscovered []string, err error) {
+	seenKeys := make(map[string]bool)
+	var cleanKeys []string
+	for _, raw := range apiKeys {
+		k := strings.TrimSpace(raw)
+		if k != "" && !seenKeys[k] {
+			seenKeys[k] = true
+			cleanKeys = append(cleanKeys, k)
+		}
+	}
+
+	if len(cleanKeys) == 0 {
+		return 0, 0, 0, 0, nil, nil, fmt.Errorf("no valid Puter auth tokens provided")
+	}
+
+	totalKeys = len(cleanKeys)
+	results = make([]BatchKeyDiscoveryResult, 0, totalKeys)
+	discoveredMap := make(map[string]bool)
+
+	for i, k := range cleanKeys {
+		res := BatchKeyDiscoveryResult{
+			Index:     i + 1,
+			KeyMasked: MaskAPIKey(k),
+		}
+
+		count, models, dErr := DiscoverAndRegisterPuterModels(ctx, db, vault, k, weight)
+		if dErr != nil {
+			res.Success = false
+			res.Error = dErr.Error()
+			failedCount++
+		} else {
+			res.Success = true
+			res.ModelsCount = count
+			res.DiscoveredIDs = models
+			successCount++
+			for _, m := range models {
+				if !discoveredMap[m] {
+					discoveredMap[m] = true
+					allDiscovered = append(allDiscovered, m)
+				}
+			}
+		}
+		results = append(results, res)
+	}
+
+	totalModels = len(allDiscovered)
+	return totalKeys, successCount, failedCount, totalModels, results, allDiscovered, nil
 }
