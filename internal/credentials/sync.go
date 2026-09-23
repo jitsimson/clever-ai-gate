@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -221,6 +222,13 @@ func (sm *SyncManager) StartListener() {
 }
 
 func (sm *SyncManager) listenLoop() {
+	const (
+		baseBackoff  = 5 * time.Second
+		maxBackoff   = 30 * time.Second
+		stableUptime = 5 * time.Minute
+	)
+
+	failures := 0
 	for {
 		select {
 		case <-sm.ctx.Done():
@@ -228,14 +236,61 @@ func (sm *SyncManager) listenLoop() {
 		default:
 		}
 
+		started := time.Now()
 		err := sm.listen()
-		if err != nil {
-			sm.logger.Error("LISTEN/NOTIFY connection error, reconnecting",
+		if err == nil {
+			continue
+		}
+
+		uptime := time.Since(started)
+		// Long-lived connections reset the backoff — we only want to back off
+		// when the database stays unreachable, not over occasional recycles of
+		// healthy hourly connections.
+		if uptime >= stableUptime {
+			failures = 0
+		}
+
+		backoff := baseBackoff << uint(failures)
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+		// ±25% jitter desynchronizes replicas so they don't reconnect in
+		// lockstep after a database restart.
+		backoff += time.Duration(rand.Int63n(int64(backoff/4) + 1))
+
+		if isExpectedListenDrop(err) {
+			sm.logger.Warn("LISTEN/NOTIFY connection recycled (expected on cloud platforms) — reconnecting",
+				zap.Duration("uptime", uptime),
+				zap.Duration("retry_in", backoff),
 				zap.Error(err),
 			)
-			time.Sleep(5 * time.Second) // Backoff before reconnect
+		} else {
+			sm.logger.Error("LISTEN/NOTIFY connection error, reconnecting",
+				zap.Duration("uptime", uptime),
+				zap.Duration("retry_in", backoff),
+				zap.Error(err),
+			)
 		}
+
+		select {
+		case <-time.After(backoff):
+		case <-sm.ctx.Done():
+			return
+		}
+		failures++
 	}
+}
+
+// isExpectedListenDrop classifies connection-recycling errors that cloud
+// platforms (Clever Cloud, Heroku…) routinely produce on otherwise healthy
+// committed connections — every ~60-minute TCP lifetime reset surfaces as an
+// unexpected EOF / reset. These are noisy, not incident-worthy.
+func isExpectedListenDrop(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection timed out")
 }
 
 func (sm *SyncManager) listen() error {

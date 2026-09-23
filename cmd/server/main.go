@@ -204,7 +204,12 @@ func main() {
 	// --- Step 8: Build HTTP transport and proxy handler ---
 	transport, edgeProber := proxy.BuildOptimizedTransport(cfg, logger)
 	httpClient := proxy.BuildHTTPClient(transport)
-	proxyHandler := proxy.NewHandler(httpClient, cacheStore, redisCacheMgr, logger, telemetryPipeline, broadcaster, alertSupervisor)
+	proxyHandler := proxy.NewHandler(httpClient, cacheStore, redisCacheMgr, logger, telemetryPipeline, broadcaster, alertSupervisor,
+		proxy.StreamOptions{
+			HeartbeatInterval: cfg.StreamHeartbeatInterval,
+			IdleTimeout:       cfg.StreamIdleTimeout,
+			MaxContinuations:  cfg.MaxStreamContinuations,
+		})
 
 	// Start edge IP probing and connection pre-warming
 	edgeProber.Start()

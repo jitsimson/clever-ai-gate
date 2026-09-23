@@ -55,6 +55,11 @@ type Config struct {
 	DialTimeout         time.Duration
 	KeepAlive           time.Duration
 
+	// Stream resilience — protects long generations from mid-stream drops
+	StreamHeartbeatInterval time.Duration
+	StreamIdleTimeout       time.Duration
+	MaxStreamContinuations  int
+
 	// Edge Probing — comma-separated list of upstream hosts to probe for
 	// fastest Anycast CDN edge IP (e.g. "api.cloudflare.com,api-inference.huggingface.co")
 	EdgeProbeHosts string
@@ -109,6 +114,14 @@ func Load() *Config {
 		IdleConnTimeout:     envDuration("IDLE_CONN_TIMEOUT", 120*time.Second),
 		DialTimeout:         envDuration("DIAL_TIMEOUT", 2*time.Second),
 		KeepAlive:           envDuration("KEEP_ALIVE", 90*time.Second),
+
+		// Stream resilience defaults — heartbeats keep intermediaries from
+		// killing "idle" long generations, the idle watchdog converts silent
+		// upstream hangs into readable errors, and seamless continuations
+		// rescue streams dropped mid-generation.
+		StreamHeartbeatInterval: envDuration("STREAM_HEARTBEAT_INTERVAL", 15*time.Second),
+		StreamIdleTimeout:       envDuration("STREAM_IDLE_TIMEOUT", 5*time.Minute),
+		MaxStreamContinuations:  envInt("MAX_STREAM_CONTINUATIONS", 2),
 
 		// Edge probing — resolves Anycast IPs and selects the fastest edge node
 		EdgeProbeHosts: envStr("EDGE_PROBE_HOSTS", "api.cloudflare.com,api-inference.huggingface.co"),

@@ -45,12 +45,20 @@ type Handler struct {
 	bufPool       sync.Pool
 	rewriter      *Rewriter
 	stream        *StreamProxy
+	streamOpts    StreamOptions
 	AlertManager  *telemetry.AlertManager
 }
 
 // NewHandler creates the proxy handler with all its dependencies.
 // broadcaster and redisCacheMgr may be nil — all methods are nil-safe no-ops.
-func NewHandler(client *http.Client, cacheStore *cache.Store, redisCacheMgr *cache.RedisCacheManager, logger *zap.Logger, pipeline *telemetry.Pipeline, broadcaster *cluster.Broadcaster, alertManager *telemetry.AlertManager) *Handler {
+// streamOpts is optional (variadic): when omitted, stream resilience defaults
+// apply — 15s heartbeats, 5m idle watchdog, 2 seamless continuations. Passing
+// an explicit StreamOptions{…} wires env-tuned values in main.go.
+func NewHandler(client *http.Client, cacheStore *cache.Store, redisCacheMgr *cache.RedisCacheManager, logger *zap.Logger, pipeline *telemetry.Pipeline, broadcaster *cluster.Broadcaster, alertManager *telemetry.AlertManager, streamOpts ...StreamOptions) *Handler {
+	opts := StreamOptions{}
+	if len(streamOpts) > 0 {
+		opts = streamOpts[0]
+	}
 	h := &Handler{
 		client:        client,
 		cache:         cacheStore,
@@ -65,8 +73,9 @@ func NewHandler(client *http.Client, cacheStore *cache.Store, redisCacheMgr *cac
 		},
 		rewriter:     NewRewriter(),
 		AlertManager: alertManager,
+		streamOpts:   opts.withDefaults(),
 	}
-	h.stream = NewStreamProxy(client, logger)
+	h.stream = NewStreamProxy(client, logger, h.streamOpts)
 	return h
 }
 
@@ -1528,17 +1537,7 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 handleSuccess:
 	// --- Success stream path ---
 	if pctx.isStream && resp.StatusCode == http.StatusOK {
-		c.Writer.Header().Set("X-Gateway-Provider", cred.Provider)
-		c.Writer.Header().Set("X-Gateway-Model-Pattern", pctx.model)
-		responseText, completionTokens := h.stream.ProxyStream(c, resp, cred.Provider, pctx.requestedModel)
-
-		// Pack completion tokens and responseText into a temporary json to pass back to the retry worker
-		type streamResult struct {
-			Text   string `json:"text"`
-			Tokens int    `json:"tokens"`
-		}
-		resJSON, _ := json.Marshal(streamResult{Text: responseText, Tokens: completionTokens})
-		return resp.StatusCode, upstreamURL, resJSON, nil
+		return h.handleStreamSuccess(c, pctx, resp, bodyBytes, upstreamURL, contentTypeOverride)
 	}
 
 	// All non-2xx responses are captured by the universal error block above.
@@ -2272,6 +2271,219 @@ func (h *Handler) findPoolByPrefix(model string) (interface{}, bool) {
 }
 
 // isCredentialAuthError returns true for status codes that indicate the
+// ─────────────────────────────────────────────────────────────────────────────
+// Mid-stream failure rescue (seamless continuation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// handleStreamSuccess pipes an upstream SSE stream to the client and applies
+// the resilient-failure policy afterwards:
+//
+//   - upstream died BEFORE any content reached the client → return 502 without
+//     touching the wire so executeWithRetry can rotate to another credential
+//     (no direct penalty here: the retry loop owns cooldowns for that);
+//   - upstream died MID-GENERATION → penalize the flaky key briefly, then run
+//     up to MaxContinuations seamless rescue legs that re-request the same
+//     upstream with the partial assistant output spliced into the messages,
+//     merging each leg into the client's stream invisibly;
+//   - still not complete after rescue → finalize with a synthetic
+//     finish_reason:"length" chunk + [DONE] so the client never hangs on a
+//     truncated generation.
+func (h *Handler) handleStreamSuccess(c *gin.Context, pctx *proxyContext, resp *http.Response, bodyBytes []byte, upstreamURL string, contentTypeOverride string) (int, string, []byte, error) {
+	cred := pctx.credential.Credential
+	c.Writer.Header().Set("X-Gateway-Provider", cred.Provider)
+	c.Writer.Header().Set("X-Gateway-Model-Pattern", pctx.model)
+
+	res := h.stream.ProxyStream(c, resp, cred.Provider, pctx.requestedModel)
+
+	if !res.Complete && !res.ClientGone {
+		if !res.HeadersCommitted {
+			// The upstream died before a single content byte was flushed — the
+			// client leg is pristine, so rotation stays possible.
+			h.logger.Error("upstream stream ended before any content — rotating to next credential",
+				zap.String("model", pctx.model),
+				zap.String("provider", cred.Provider),
+				zap.String("upstream_url", upstreamURL),
+				zap.Error(res.Err),
+			)
+			errMsg := "upstream stream ended before producing content"
+			if res.Err != nil {
+				errMsg = res.Err.Error()
+			}
+			return http.StatusBadGateway, upstreamURL, []byte(errMsg), nil
+		}
+
+		// Content already streamed to the client — a 502 would corrupt the
+		// leg. Penalize the flaky key for future requests (the retry loop will
+		// NOT also penalize: it sees a 200), then rescue in place.
+		h.penalizeInterruptedCredential(c, pctx)
+		res = h.attemptStreamRescue(c, pctx, bodyBytes, upstreamURL, contentTypeOverride, res)
+	}
+
+	h.stream.FinalizeStream(c, cred.Provider, &res)
+
+	// Pack the stream outcome for the retry worker's telemetry. The legacy
+	// contract {"text","tokens"} is preserved; extra diagnostic fields are
+	// ignored by existing readers.
+	type streamResult struct {
+		Text      string `json:"text"`
+		Tokens    int    `json:"tokens"`
+		Complete  bool   `json:"complete"`
+		Truncated bool   `json:"truncated"`
+	}
+	resJSON, _ := json.Marshal(streamResult{
+		Text:      res.Text,
+		Tokens:    res.Tokens,
+		Complete:  res.Complete,
+		Truncated: !res.Complete && res.HeadersCommitted && !res.ClientGone,
+	})
+	return resp.StatusCode, upstreamURL, resJSON, nil
+}
+
+// penalizeInterruptedCredential marks a credential that dropped an in-flight
+// stream: a short 10s cooldown (this is flakiness, not exhaustion — the key may
+// be perfectly healthy seconds later), a cluster broadcast so replicas agree,
+// and a failover record for alerting. Called only when content already reached
+// the client leg — the retry loop handles penalties for the rotation path.
+func (h *Handler) penalizeInterruptedCredential(c *gin.Context, pctx *proxyContext) {
+	result := pctx.credential
+	if result == nil || result.FromPool == nil {
+		return
+	}
+	cooldown := 10 * time.Second
+	result.FromPool.PenalizeToken(result.Index, cooldown)
+	h.broadcaster.PublishPenalize(result.FromPool.ModelPattern, result.Credential.ID, result.Index, time.Now().Add(cooldown))
+	if h.AlertManager != nil {
+		_ = h.AlertManager.TrackFailover(c.Request.Context(), result.Credential.ID,
+			result.FromPool.ModelPattern, "upstream stream interrupted mid-flight")
+	}
+}
+
+// attemptStreamRescue performs up to MaxContinuations seamless rescue legs.
+// Each leg re-requests the same upstream with the partial assistant output
+// spliced into the request messages (a plain re-request when nothing was
+// streamed) and pipes the continuation SSE into the already-open client leg.
+func (h *Handler) attemptStreamRescue(c *gin.Context, pctx *proxyContext, bodyBytes []byte, upstreamURL string, contentTypeOverride string, res StreamResult) StreamResult {
+	cred := pctx.credential.Credential
+	partial := res.Content
+	if partial == "" {
+		partial = res.Reasoning
+	}
+
+	// Tool calls cannot be merged mid-flight: half-streamed arguments JSON plus
+	// whatever a continuation regenerates would corrupt the tool call.
+	if res.SawToolCalls {
+		h.logger.Error("stream interrupted mid tool-call — rescue unsafe, truncating",
+			zap.String("model", pctx.model),
+			zap.String("provider", cred.Provider),
+			zap.Error(res.Err),
+		)
+		return res
+	}
+	// Content was forwarded but could not be accumulated (unparseable chunk
+	// shapes) — a re-request would duplicate it on the client leg.
+	if partial == "" && res.SawDataChunk {
+		h.logger.Error("stream interrupted after unaccumulatable output — rescue disabled",
+			zap.String("model", pctx.model),
+			zap.String("provider", cred.Provider),
+			zap.Error(res.Err),
+		)
+		return res
+	}
+
+	for attempt := 1; attempt <= h.streamOpts.MaxContinuations; attempt++ {
+		if c.Request.Context().Err() != nil {
+			res.ClientGone = true
+			return res
+		}
+
+		contBody, ok := buildContinuationBody(bodyBytes, partial)
+		if !ok {
+			h.logger.Error("stream interruption cannot be rescued — request format lacks an appendable messages array",
+				zap.String("model", pctx.model),
+				zap.String("provider", cred.Provider),
+			)
+			return res
+		}
+
+		h.logger.Warn("upstream stream interrupted mid-flight — attempting seamless continuation",
+			zap.String("model", pctx.model),
+			zap.String("provider", cred.Provider),
+			zap.String("upstream_url", upstreamURL),
+			zap.Int("attempt", attempt),
+			zap.Int("max_attempts", h.streamOpts.MaxContinuations),
+			zap.Int("partial_bytes", len(partial)),
+			zap.Error(res.Err),
+		)
+
+		contReq, reqErr := http.NewRequestWithContext(
+			c.Request.Context(),
+			c.Request.Method,
+			upstreamURL,
+			bytes.NewReader(contBody),
+		)
+		if reqErr != nil {
+			h.logger.Error("continuation request build failed", zap.Error(reqErr))
+			return res
+		}
+		h.rewriter.RewriteHeaders(contReq, cred.Provider, cred.APIKey, c.Request.Header)
+		// --- Puter Edge Firewall De-fingerprinting (mirrors forwardRequest) ---
+		if cred.Provider == "puter" {
+			randomIP := generateRandomIP()
+			contReq.Header.Set("X-Forwarded-For", randomIP)
+			contReq.Header.Set("X-Real-IP", randomIP)
+			contReq.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		}
+		if contentTypeOverride != "" {
+			contReq.Header.Set("Content-Type", contentTypeOverride)
+		}
+
+		contResp, doErr := h.client.Do(contReq)
+		if doErr != nil {
+			h.logger.Warn("continuation attempt transport error",
+				zap.Int("attempt", attempt), zap.Error(doErr))
+			continue
+		}
+		if contResp.StatusCode < 200 || contResp.StatusCode >= 300 {
+			snippet, _ := io.ReadAll(io.LimitReader(contResp.Body, 2048))
+			contResp.Body.Close()
+			h.logger.Error("continuation attempt rejected by upstream — finalizing truncated stream",
+				zap.Int("attempt", attempt),
+				zap.Int("status", contResp.StatusCode),
+				zap.ByteString("upstream_error_body", snippet),
+			)
+			return res
+		}
+
+		contRes := h.stream.ProxyStream(c, contResp, cred.Provider, pctx.requestedModel)
+		res = mergeStreamResult(res, contRes)
+
+		if res.Complete {
+			h.logger.Info("seamless stream continuation succeeded",
+				zap.String("model", pctx.model),
+				zap.String("provider", cred.Provider),
+				zap.Int("attempts", attempt),
+				zap.Int("total_chars", len(res.Text)),
+			)
+			return res
+		}
+		if res.ClientGone {
+			return res
+		}
+
+		partial = res.Content
+		if partial == "" {
+			partial = res.Reasoning
+		}
+	}
+
+	h.logger.Error("stream rescue exhausted — finalizing truncated stream",
+		zap.String("model", pctx.model),
+		zap.String("provider", cred.Provider),
+		zap.Int("attempts", h.streamOpts.MaxContinuations),
+		zap.Int("partial_chars", len(res.Text)),
+	)
+	return res
+}
 // specific API key is rejected by the provider, or the model is not accessible
 // on this account's plan. All of these warrant an immediate key rotation with
 // a long cooldown — the key is broken for this model, not the request itself.
