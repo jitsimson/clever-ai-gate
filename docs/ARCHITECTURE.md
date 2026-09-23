@@ -266,3 +266,45 @@ The `Rewriter` transforms OpenAI-compatible paths and headers to each provider's
 
 #### Optimized HTTP Transport (`transport.go`)
 - **TCP_NODELAY** enabled via raw syscall — disables Nagle's algorithm so SSE token chunks flush
+
+#### Stream Resilience & Mid-Stream Failure Rescue (`stream.go`, `continuation.go`)
+
+Long generations (minutes long, thinking-heavy models) die mid-stream behind reseller
+load balancers: `unexpected EOF`, `incomplete chunked read`, silent stalls, and in-band
+error objects injected as SSE data chunks. Historically the first mid-flight failure
+ended the response as a 502 — the client lost everything generated so far. The
+stream subsystem now treats streaming as a resilient, repairable pipeline:
+
+- **In-band error detection** (`stream.go`): a top-level `"error"` JSON key inside a
+  `data:` chunk (the way OpenAI-compatible resellers abort mid-generation) is caught
+  *before* forwarding the garbage to the client leg, and surfaced as `StreamResult.Err`.
+- **Completion detection**: SSE/NDJSON streams are complete only on an explicit
+  marker (`data: [DONE]` or a non-null `finish_reason`). A markerless EOF — exactly how
+  resellers truncate generations around ~109s — is treated as an interruption. Gemini's
+  JSON-array streams treat clean EOF as completion.
+- **Lazy client-leg commit**: the 200/SSE headers are flushed only with the first
+  byte of content. An upstream that dies before producing anything leaves the client
+  leg pristine, so `executeWithRetry` can still rotate to another credential with a
+  normal 502 (no double penalty — the retry loop owns cooldowns for that path).
+- **Heartbeats** (`STREAM_HEARTBEAT_INTERVAL`, default 15s): `: keep-alive` SSE
+  comments are emitted during silent upstream pauses (reasoning/thinking), keeping
+  browsers, nginx instances and cloud routers from killing the connection as idle. A
+  dedicated reader goroutine multiplexes upstream lines against heartbeat ticks and
+  the client context, so beats fire even while the upstream `Read` blocks.
+- **Idle watchdog** (`STREAM_IDLE_TIMEOUT`, default 5m): a stalled upstream body is
+  force-closed and the stall converted into a readable error — silent hangs become
+  recoverable interruptions instead of hung clients.
+- **Seamless continuation** (`MAX_STREAM_CONTINUATIONS`, default 2): when a stream
+  dies after content reached the client, the gateway re-requests the same upstream
+  with the partial assistant output spliced into `messages` via `jsonparser`
+  (in-place, reflection-free) plus a continue-instruction user turn, and pipes the
+  new SSE leg into the *same client response*. The IDE never notices — unless every
+  rescue leg fails, in which case the response is closed with a synthetic
+  `finish_reason:"length"` chunk + `[DONE]` so clients render a visibly-cut answer
+  instead of hanging forever. Mid-tool-call interruptions are not resumed (merged
+  arguments JSON would corrupt the call) and instead finish with
+  `finish_reason:"tool_calls"`.
+- Interruption causes are logged at `Error` level ("upstream stream interrupted
+  mid-flight — attempting seamless continuation" / "rotating to next credential")
+  so gateway logs finally surface the failure classes that previously only appeared
+  in client UIs.

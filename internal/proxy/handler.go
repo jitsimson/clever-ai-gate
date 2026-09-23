@@ -2484,6 +2484,7 @@ func (h *Handler) attemptStreamRescue(c *gin.Context, pctx *proxyContext, bodyBy
 	)
 	return res
 }
+
 // specific API key is rejected by the provider, or the model is not accessible
 // on this account's plan. All of these warrant an immediate key rotation with
 // a long cooldown — the key is broken for this model, not the request itself.
@@ -3120,4 +3121,3 @@ func isEmbeddingModel(model string) bool {
 		strings.Contains(lower, "gte-") ||
 		strings.Contains(lower, "sentence-")
 }
-

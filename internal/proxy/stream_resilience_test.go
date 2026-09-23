@@ -410,9 +410,9 @@ func TestBuildContinuationBody_EmptyPartialIsFullRetry(t *testing.T) {
 
 func TestBuildContinuationBody_UnsupportedFormatsReturnFalse(t *testing.T) {
 	cases := map[string][]byte{
-		"gemini-transpiled": []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`),
+		"gemini-transpiled":  []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`),
 		"messages-not-array": []byte(`{"messages":"nope"}`),
-		"empty-body":        nil,
+		"empty-body":         nil,
 	}
 	for name, body := range cases {
 		if g, _ := buildContinuationBody(body, "partial"); g != nil {

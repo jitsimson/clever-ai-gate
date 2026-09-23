@@ -86,13 +86,13 @@ type StreamResult struct {
 	Tokens int // chunk-count token estimate (legacy telemetry contract)
 
 	// Lifecycle flags consumed by the handler's rotation/rescue/finalize logic.
-	Complete         bool   // upstream signalled a clean end ([DONE], finish_reason, done:true)
-	Err              error  // non-nil when the stream ended abnormally
-	ClientGone       bool   // client disconnected mid-stream
-	HeadersCommitted bool   // 200 + SSE headers were flushed toward the client
-	SawDataChunk     bool   // at least one data chunk was forwarded
-	SawToolCalls     bool   // any translated chunk contained tool_calls
-	SawFinish        bool   // a non-null finish_reason reached the client
+	Complete         bool  // upstream signalled a clean end ([DONE], finish_reason, done:true)
+	Err              error // non-nil when the stream ended abnormally
+	ClientGone       bool  // client disconnected mid-stream
+	HeadersCommitted bool  // 200 + SSE headers were flushed toward the client
+	SawDataChunk     bool  // at least one data chunk was forwarded
+	SawToolCalls     bool  // any translated chunk contained tool_calls
+	SawFinish        bool  // a non-null finish_reason reached the client
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
