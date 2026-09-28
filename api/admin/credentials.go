@@ -622,30 +622,58 @@ func (h *CredentialHandler) RegisterCustomProvider(c *gin.Context) {
 // pools for each, and binds the credential to all of them in one transaction.
 //
 // 1min.ai does not expose a /v1/models endpoint, so the full catalog is maintained
-// as a static manifest. The API key is validated via a lightweight chat request
+// as a static manifest. Each API key is validated via a lightweight chat request
 // before registration begins. Adding the provider requires only the API key —
 // the base URL is hardcoded to https://api.1min.ai.
 //
+// Multiple keys can be submitted at once (api_keys array, or api_key containing
+// newline/comma-separated keys): each key is processed one by one and bound to
+// every 1min.ai model pool for round-robin load balancing, mirroring the
+// custom-provider batch workflow. A per-key report is returned so the admin UI
+// can show exactly which keys were imported and which failed.
+//
 // @Summary      Auto-discover 1min.ai Models
-// @Description  Submits a 1min.ai key, validates it, and registers all models across all modalities automatically
+// @Description  Submits one or many 1min.ai keys, validates each, and registers all models across all modalities automatically
 // @Tags         Credentials
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      dto.DiscoverProviderRequest  true  "1min.ai provider details (api_key required, base_url ignored)"
+// @Param        body  body      dto.DiscoverOneMinAIRequest  true  "1min.ai provider details (api_key or api_keys required)"
 // @Success      200   {object}  dto.DiscoverProviderResponse
 // @Failure      400   {object}  dto.ErrorResponse
 // @Failure      500   {object}  dto.ErrorResponse
 // @Router       /api/v1/admin/providers/1minai [post]
 func (h *CredentialHandler) RegisterOneMinAIProvider(c *gin.Context) {
-	var req dto.DiscoverProviderRequest
+	var req dto.DiscoverOneMinAIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "invalid request body", Details: err.Error()})
 		return
 	}
 
-	if req.APIKey == "" {
-		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "api_key is required for 1min.ai auto-discovery"})
+	// Normalize keys: prefer the explicit api_keys array; fall back to splitting
+	// api_key on newlines/commas so bulk pastes work through either field.
+	var keys []string
+	for _, k := range req.APIKeys {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+
+	if len(keys) == 0 && req.APIKey != "" {
+		rawKeys := strings.FieldsFunc(req.APIKey, func(r rune) bool {
+			return r == '\n' || r == '\r' || r == ','
+		})
+		for _, rk := range rawKeys {
+			rk = strings.TrimSpace(rk)
+			if rk != "" {
+				keys = append(keys, rk)
+			}
+		}
+	}
+
+	if len(keys) == 0 {
+		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "api_key or api_keys is required for 1min.ai auto-discovery"})
 		return
 	}
 
@@ -653,26 +681,75 @@ func (h *CredentialHandler) RegisterOneMinAIProvider(c *gin.Context) {
 		req.Weight = 1
 	}
 
-	count, models, err := credentials.DiscoverAndRegisterOneMinAIModels(
-		c.Request.Context(),
-		h.db,
-		h.vault,
-		req.APIKey,
-		req.Weight,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "1min.ai auto-discovery failed", Details: err.Error()})
+	// Single key workflow — preserves the original response shape.
+	if len(keys) == 1 && len(req.APIKeys) == 0 {
+		count, models, err := credentials.DiscoverAndRegisterOneMinAIModels(
+			c.Request.Context(),
+			h.db,
+			h.vault,
+			keys[0],
+			req.Weight,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "1min.ai auto-discovery failed", Details: err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, dto.DiscoverProviderResponse{
+			Message:       fmt.Sprintf("Successfully synchronized %d 1min.ai models across all modalities", count),
+			ModelsCount:   count,
+			DiscoveredIDs: models,
+		})
+
+		// Invalidate Redis cache so all cluster nodes instantly see new 1min.ai models.
+		h.redisCacheMgr.InvalidateAndPublish(c.Request.Context())
 		return
 	}
 
+	// Batch keys workflow — each key is validated, discovered, and bound one by one.
+	totalKeys, successCount, failedCount, totalModels, results, allDiscovered, err := credentials.DiscoverAndRegisterOneMinAIModelsBatch(
+		c.Request.Context(),
+		h.db,
+		h.vault,
+		keys,
+		req.Weight,
+	)
+	if err != nil && successCount == 0 {
+		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "1min.ai batch auto-discovery failed", Details: err.Error()})
+		return
+	}
+
+	batchResults := make([]dto.BatchKeyResult, len(results))
+	for i, r := range results {
+		batchResults[i] = dto.BatchKeyResult{
+			Index:         r.Index,
+			KeyMasked:     r.KeyMasked,
+			Success:       r.Success,
+			ModelsCount:   r.ModelsCount,
+			DiscoveredIDs: r.DiscoveredIDs,
+			Error:         r.Error,
+		}
+	}
+
+	msg := fmt.Sprintf("Successfully synchronized %d unique 1min.ai models across %d of %d keys", totalModels, successCount, totalKeys)
+	if failedCount > 0 {
+		msg = fmt.Sprintf("Batch discovery completed: %d of %d keys succeeded, %d failed (%d unique models synchronized)", successCount, totalKeys, failedCount, totalModels)
+	}
+
 	c.JSON(http.StatusOK, dto.DiscoverProviderResponse{
-		Message:       fmt.Sprintf("Successfully synchronized %d 1min.ai models across all modalities", count),
-		ModelsCount:   count,
-		DiscoveredIDs: models,
+		Message:       msg,
+		ModelsCount:   totalModels,
+		DiscoveredIDs: allDiscovered,
+		TotalKeys:     totalKeys,
+		SuccessCount:  successCount,
+		FailedCount:   failedCount,
+		Results:       batchResults,
 	})
 
-	// Invalidate Redis cache so all cluster nodes instantly see new 1min.ai models.
-	h.redisCacheMgr.InvalidateAndPublish(c.Request.Context())
+	if successCount > 0 {
+		// Invalidate Redis cache so all cluster nodes instantly see new 1min.ai models.
+		h.redisCacheMgr.InvalidateAndPublish(c.Request.Context())
+	}
 }
 
 // RegisterCloudflareProvider auto-discovers all Cloudflare Workers AI models

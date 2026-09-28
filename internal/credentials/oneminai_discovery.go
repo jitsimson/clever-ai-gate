@@ -187,3 +187,67 @@ func applyOneMinAIOverrides(caps *ModelCapabilities, modality string) {
 		caps.Code = true
 	}
 }
+
+// DiscoverAndRegisterOneMinAIModelsBatch processes multiple 1min.ai API keys one
+// by one: each key is validated via a lightweight chat request, and every key
+// that passes discovery is bound to all 1min.ai model pools across the five
+// modalities — mirroring the custom-provider batch workflow so admins can
+// register a stack of 1min.ai keys for round-robin load balancing in a single
+// request.
+//
+// A per-key report (masked key, success flag, model count, error) is collected so
+// the admin UI can display exactly which keys were imported and which failed.
+func DiscoverAndRegisterOneMinAIModelsBatch(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	vault *Vault,
+	apiKeys []string,
+	weight int,
+) (totalKeys, successCount, failedCount, totalModels int, results []BatchKeyDiscoveryResult, allDiscovered []string, err error) {
+	seenKeys := make(map[string]bool)
+	var cleanKeys []string
+	for _, raw := range apiKeys {
+		k := strings.TrimSpace(raw)
+		if k != "" && !seenKeys[k] {
+			seenKeys[k] = true
+			cleanKeys = append(cleanKeys, k)
+		}
+	}
+
+	if len(cleanKeys) == 0 {
+		return 0, 0, 0, 0, nil, nil, fmt.Errorf("no valid 1min.ai API keys provided")
+	}
+
+	totalKeys = len(cleanKeys)
+	results = make([]BatchKeyDiscoveryResult, 0, totalKeys)
+	discoveredMap := make(map[string]bool)
+
+	for i, k := range cleanKeys {
+		res := BatchKeyDiscoveryResult{
+			Index:     i + 1,
+			KeyMasked: MaskAPIKey(k),
+		}
+
+		count, models, dErr := DiscoverAndRegisterOneMinAIModels(ctx, db, vault, k, weight)
+		if dErr != nil {
+			res.Success = false
+			res.Error = dErr.Error()
+			failedCount++
+		} else {
+			res.Success = true
+			res.ModelsCount = count
+			res.DiscoveredIDs = models
+			successCount++
+			for _, m := range models {
+				if !discoveredMap[m] {
+					discoveredMap[m] = true
+					allDiscovered = append(allDiscovered, m)
+				}
+			}
+		}
+		results = append(results, res)
+	}
+
+	totalModels = len(allDiscovered)
+	return totalKeys, successCount, failedCount, totalModels, results, allDiscovered, nil
+}

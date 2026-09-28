@@ -255,6 +255,17 @@ type DiscoverPuterRequest struct {
 	Weight  int      `json:"weight,omitempty" example:"1"`
 }
 
+// DiscoverOneMinAIRequest is the request body for POST /api/v1/admin/providers/1min
+// needs an API key — the base URL is hardcoded to https://api.1min.ai. Multiple keys can be
+// submitted at once via api_keys (or newline/comma-separated api_key) for bulk
+// registration; each key is validated, discovered, and bound to the model pools
+// one by one, mirroring the custom-provider batch workflow.
+type DiscoverOneMinAIRequest struct {
+	APIKey  string   `json:"api_key,omitempty" example:"..."`
+	APIKeys []string `json:"api_keys,omitempty"`
+	Weight  int      `json:"weight,omitempty" example:"1"`
+}
+
 // DiscoverAgentRouterRequest is the request body for POST /api/v1/admin/providers/agentrouter.
 // AgentRouter only needs an API key — the base URL is hardcoded to
 // https://ps.air-outer.com/v1. Multiple keys can be added for round-robin rotation

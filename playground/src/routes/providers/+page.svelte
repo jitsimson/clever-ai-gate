@@ -256,7 +256,7 @@
   }
 
   async function autoDiscoverProvider() {
-    if ((autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter') && customKeyMode === 'batch') {
+    if ((autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter' || autoDiscoverForm.provider === '1minai') && customKeyMode === 'batch') {
       if (parsedBatchKeys.length === 0) {
         appState.addToast('error', 'Please enter at least one API key in the batch input box');
         return;
@@ -299,7 +299,7 @@
           api_token: autoDiscoverForm.api_token,
           weight: autoDiscoverForm.weight || 1
         };
-      } else if ((autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter') && customKeyMode === 'batch') {
+      } else if ((autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter' || autoDiscoverForm.provider === '1minai') && customKeyMode === 'batch') {
         payload = {
           provider: autoDiscoverForm.provider,
           api_keys: parsedBatchKeys,
@@ -1093,7 +1093,7 @@
 
       {#if autoDiscoverForm.provider === '1minai'}
         <div class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-xs text-emerald-400 leading-relaxed">
-          🤖 <strong>1min.ai</strong> supports all modalities: Writing, Image, Audio, Video, and Code. All models are auto-discovered from a static manifest — just enter your API key. Get your key at <a href="https://app.1min.ai" target="_blank" rel="noopener noreferrer" class="underline">app.1min.ai</a>.
+          🤖 <strong>1min.ai</strong> supports all modalities: Writing, Image, Audio, Video, and Code. All models are auto-discovered from a static manifest — just enter your API key, or switch to <strong>Bulk / Batch Keys</strong> mode to paste many keys at once; each key is validated and registered one by one for round-robin load balancing. Get your key at <a href="https://app.1min.ai" target="_blank" rel="noopener noreferrer" class="underline">app.1min.ai</a>.
         </div>
       {/if}
 
@@ -1133,7 +1133,7 @@
         </div>
       {/if}
 
-      {#if autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter'}
+      {#if autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter' || autoDiscoverForm.provider === '1minai'}
         {#if autoDiscoverForm.provider === 'custom'}
           <Input type="text" label="Label (namespace prefix)" placeholder="e.g. huggingface, together, deepinfra" bind:value={autoDiscoverForm.label} />
         {/if}
@@ -1171,7 +1171,7 @@
         {#if customKeyMode === 'batch'}
           <div class="flex flex-col gap-1.5">
             <div class="flex items-center justify-between">
-              <span class="text-xs font-bold uppercase tracking-wider text-secondary">{autoDiscoverForm.provider === 'puter' ? 'Puter Auth Tokens (Bulk)' : 'API Keys (Bulk)'}</span>
+              <span class="text-xs font-bold uppercase tracking-wider text-secondary">{autoDiscoverForm.provider === 'puter' ? 'Puter Auth Tokens (Bulk)' : autoDiscoverForm.provider === '1minai' ? '1min.ai API Keys (Bulk)' : 'API Keys (Bulk)'}</span>
               {#if parsedBatchKeysCount > 0}
                 <span class="text-xs font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full flex items-center gap-1">
                   <CheckCircle size={11} /> {parsedBatchKeysCount} {parsedBatchKeysCount === 1 ? 'key' : 'keys'} detected
@@ -1183,17 +1183,19 @@
               rows={5}
               placeholder={autoDiscoverForm.provider === 'puter'
                 ? 'Paste multiple Puter Auth Tokens here (one per line, or comma-separated)...&#10;eyJhbGciOiJIUzI1NiIs...token1&#10;eyJhbGciOiJIUzI1NiIs...token2'
+                : autoDiscoverForm.provider === '1minai'
+                ? 'Paste multiple 1min.ai API keys here (one key per line, or comma-separated)...&#10;1min-key-1...&#10;1min-key-2...&#10;1min-key-3...'
                 : 'Paste multiple API keys here (one key per line, or comma-separated)...&#10;sk-key-1...&#10;sk-key-2...&#10;sk-key-3...'}
               bind:value={batchKeysText}
             />
-            <p class="text-[11px] text-secondary/70">{autoDiscoverForm.provider === 'puter' ? 'Each token is validated and auto-discovered one by one. Successful tokens bind to all Puter.com model pools for round-robin load balancing.' : 'Each key will be auto-discovered. Successful keys will bind to the model pools for round-robin load balancing.'}</p>
+            <p class="text-[11px] text-secondary/70">{autoDiscoverForm.provider === 'puter' ? 'Each token is validated and auto-discovered one by one. Successful tokens bind to all Puter.com model pools for round-robin load balancing.' : autoDiscoverForm.provider === '1minai' ? 'Each key is validated and auto-discovered one by one. Successful keys bind to all 1min.ai model pools across every modality for round-robin load balancing.' : 'Each key will be auto-discovered. Successful keys will bind to the model pools for round-robin load balancing.'}</p>
           </div>
         {:else}
-          <Input 
-            type="password" 
-            label={autoDiscoverForm.provider === 'puter' ? 'Puter Auth Token' : 'API Key'} 
-            placeholder={autoDiscoverForm.provider === 'puter' ? 'Puter Auth Token...' : 'Bearer API key...'} 
-            bind:value={autoDiscoverForm.api_key} 
+          <Input
+            type="password"
+            label={autoDiscoverForm.provider === 'puter' ? 'Puter Auth Token' : autoDiscoverForm.provider === '1minai' ? '1min.ai API Key' : 'API Key'}
+            placeholder={autoDiscoverForm.provider === 'puter' ? 'Puter Auth Token...' : autoDiscoverForm.provider === '1minai' ? '1min.ai API key...' : 'Bearer API key...'}
+            bind:value={autoDiscoverForm.api_key}
           />
         {/if}
       {/if}
@@ -1212,15 +1214,14 @@
           placeholder="Workers AI API Token..."
           bind:value={autoDiscoverForm.api_token}
         />
-      {:else if autoDiscoverForm.provider !== 'custom' && autoDiscoverForm.provider !== 'puter'}
-        <Input 
-          type="password" 
-          label="API Key" 
+      {:else if autoDiscoverForm.provider !== 'custom' && autoDiscoverForm.provider !== 'puter' && autoDiscoverForm.provider !== '1minai'}
+        <Input
+          type="password"
+          label="API Key"
           placeholder={
             autoDiscoverForm.provider === 'nvidia' ? 'nvapi-...' :
             autoDiscoverForm.provider === 'ollama' ? 'Ollama Cloud API key...' :
             autoDiscoverForm.provider === 'openrouter' ? 'sk-or-v1-...' :
-            autoDiscoverForm.provider === '1minai' ? '1min.ai API key...' :
             autoDiscoverForm.provider === 'sarvam' ? 'Sarvam API key (api-subscription-key)...' :
             autoDiscoverForm.provider === 'puter' ? 'Puter Auth Token...' :
             autoDiscoverForm.provider === 'agentrouter' ? 'AgentRouter API key (sk-...)...' :
@@ -1244,7 +1245,7 @@
             <RefreshCw size={16} class="animate-spin text-orange-400 shrink-0" />
             <div class="flex flex-col">
               <span class="text-xs font-semibold text-orange-400">
-                {#if (autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter') && customKeyMode === 'batch' && parsedBatchKeysCount > 0}
+                {#if (autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter' || autoDiscoverForm.provider === '1minai') && customKeyMode === 'batch' && parsedBatchKeysCount > 0}
                   Auto-discovering and registering {parsedBatchKeysCount} keys...
                 {:else}
                   Validating credentials and synchronizing models...
@@ -1326,7 +1327,7 @@
             {#if autoDiscoverLoading}
               <span class="animate-spin">⟳</span> Discovering...
             {:else}
-              Discover & Register {(autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter') && customKeyMode === 'batch' && parsedBatchKeysCount > 0 ? `(${parsedBatchKeysCount} Keys)` : ''}
+              Discover & Register {(autoDiscoverForm.provider === 'custom' || autoDiscoverForm.provider === 'puter' || autoDiscoverForm.provider === '1minai') && customKeyMode === 'batch' && parsedBatchKeysCount > 0 ? `(${parsedBatchKeysCount} Keys)` : ''}
             {/if}
           </Button>
         {/if}
